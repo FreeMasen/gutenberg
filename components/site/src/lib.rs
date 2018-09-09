@@ -782,9 +782,10 @@ impl Site {
             return Ok(());
         }
 
-        context.insert("last_build_date", &pages[0].meta.date.clone().map(|d| d.to_string()));
+        let (sorted_pages, _) = sort_pages(pages, SortBy::Date);
+        context.insert("last_build_date", &sorted_pages[0].meta.date.clone().map(|d| d.to_string()));
         // limit to the last n elements
-        context.insert("pages", &pages.iter().take(self.config.rss_limit).collect::<Vec<_>>());
+        context.insert("pages", &sorted_pages.iter().take(self.config.rss_limit).collect::<Vec<_>>());
         context.insert("config", &self.config);
 
         let rss_feed_url = if let Some(ref base) = base_path {
