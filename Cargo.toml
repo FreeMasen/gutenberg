@@ -30,6 +30,8 @@ actix-web = { version = "0.7", default-features = false, features = [] }
 notify = "4"
 ws = "0.7"
 ctrlc = "3"
+log = "0.4"
+env_logger = "0.5"
 
 site = { path = "components/site" }
 errors = { path = "components/errors" }

@@ -21,36 +21,21 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-use std::env;
-use std::fs::{remove_dir_all, File};
+use std::fs::{File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
-use std::time::{Instant, Duration};
 use std::thread;
 
-use chrono::prelude::*;
 use actix_web::{self, fs, http, server, App, HttpRequest, HttpResponse, Responder};
-use actix_web::middleware::{Middleware, Started, Response};
-use notify::{Watcher, RecursiveMode, watcher};
+use actix_web::middleware::{Middleware, Started, Response, Logger};
 use ws::{WebSocket, Sender, Message};
-use ctrlc;
+use utils::net::get_available_port;
 
-use site::Site;
-use errors::{Result, ResultExt};
-use utils::fs::copy_file;
-
+use errors::{Result};
 use console;
-use rebuild;
+use super::watch;
 
-#[derive(Debug, PartialEq)]
-enum ChangeKind {
-    Content,
-    Templates,
-    StaticFiles,
-    Sass,
-    Config,
-}
 
 // Uglified using uglifyjs
 // Also, commenting out the lines 330-340 (containing `e instanceof ProtocolError`) was needed
@@ -90,44 +75,7 @@ fn livereload_handler(_: &HttpRequest) -> &'static str {
     LIVE_RELOAD
 }
 
-fn rebuild_done_handling(broadcaster: &Sender, res: Result<()>, reload_path: &str) {
-    match res {
-        Ok(_) => {
-            broadcaster.send(format!(r#"
-                {{
-                    "command": "reload",
-                    "path": "{}",
-                    "originalPath": "",
-                    "liveCSS": true,
-                    "liveImg": true,
-                    "protocol": ["http://livereload.com/protocols/official-7"]
-                }}"#, reload_path)
-            ).unwrap();
-        },
-        Err(e) => console::unravel_errors("Failed to build the site", &e)
-    }
-}
 
-fn create_new_site(interface: &str, port: &str, output_dir: &str, base_url: &str, config_file: &str) -> Result<(Site, String)> {
-    let mut site = Site::new(env::current_dir().unwrap(), config_file)?;
-
-    let base_address = format!("{}:{}", base_url, port);
-    let address = format!("{}:{}", interface, port);
-    let base_url = if site.config.base_url.ends_with('/') {
-        format!("http://{}/", base_address)
-    } else {
-        format!("http://{}", base_address)
-    };
-
-    site.set_base_url(base_url);
-    site.set_output_path(output_dir);
-    site.load()?;
-    site.enable_live_reload();
-    console::notify_site_size(&site);
-    console::warn_about_ignored_pages(&site);
-    site.build()?;
-    Ok((site, address))
-}
 
 /// Attempt to render `index.html` when a directory is requested.
 ///
@@ -147,40 +95,33 @@ fn handle_directory<'a, 'b>(dir: &'a fs::Directory, req: &'b HttpRequest) -> io:
     fs::NamedFile::open(path)?.respond_to(req)
 }
 
-pub fn serve(interface: &str, port: &str, output_dir: &str, base_url: &str, config_file: &str) -> Result<()> {
-    let start = Instant::now();
-    let (mut site, address) = create_new_site(interface, port, output_dir, base_url, config_file)?;
-    console::report_elapsed_time(start);
-
-    // Setup watchers
-    let mut watching_static = false;
+pub fn serve(interface: &str, port: &str, output_dir: &str, _base_url: &str, config_file: &str) -> Result<()> {
+    println!("serve {}, {}, {}, {}, {}", interface, port, output_dir, _base_url, config_file);
     let (tx, rx) = channel();
-    let mut watcher = watcher(tx, Duration::from_secs(2)).unwrap();
-    watcher.watch("content/", RecursiveMode::Recursive)
-        .chain_err(|| "Can't watch the `content` folder. Does it exist?")?;
-    watcher.watch("templates/", RecursiveMode::Recursive)
-        .chain_err(|| "Can't watch the `templates` folder. Does it exist?")?;
-    watcher.watch(config_file, RecursiveMode::Recursive)
-        .chain_err(|| "Can't watch the `config` file. Does it exist?")?;
 
-    if Path::new("static").exists() {
-        watching_static = true;
-        watcher.watch("static/", RecursiveMode::Recursive)
-            .chain_err(|| "Can't watch the `static` folder. Does it exist?")?;
-    }
-
-    // Sass support is optional so don't make it an error to no have a sass folder
-    let _ = watcher.watch("sass/", RecursiveMode::Recursive);
-
-    let ws_address = format!("{}:{}", interface, site.live_reload.unwrap());
+    let ws_address = format!("{}:{}", interface, get_available_port().unwrap());
+    println!("ws_address: {}", ws_address);
     let output_path = Path::new(output_dir).to_path_buf();
-
+    let address = format!("{}:{}", interface, port);
+    println!("address: {}", address);
     // output path is going to need to be moved later on, so clone it for the
     // http closure to avoid contention.
     let static_root = output_path.clone();
+    let base_url = address.clone();
+    let config_file = config_file.to_string();
+    let output_dir = output_dir.to_string();
     thread::spawn(move || {
+        watch::watch(&output_dir, &base_url, &config_file, &Some(tx)).unwrap();
+    });
+    //wait for the first build to complete
+    rx.recv().unwrap();
+
+    thread::spawn(move || {
+
+        println!("starting server, static_root: {:?}", static_root);
         let s = server::new(move || {
             App::new()
+            .middleware(Logger::default())
             .middleware(NotFoundHandler { rendered_template: static_root.join("404.html") })
             .resource(r"/livereload.js", |r| r.f(livereload_handler))
             // Start a webserver that serves the `output_dir` directory
@@ -213,134 +154,23 @@ pub fn serve(interface: &str, port: &str, output_dir: &str, base_url: &str, conf
             }
             Ok(())
         }
-    }).unwrap();
+    }).expect("Failed to create ws server");
+    println!("starting ws server");
     let broadcaster = ws_server.broadcaster();
     thread::spawn(move || {
         ws_server.listen(&*ws_address).unwrap();
     });
 
-    let pwd = env::current_dir().unwrap();
-
-    let mut watchers = vec!["content", "templates", "config.toml"];
-    if watching_static {
-        watchers.push("static");
-    }
-    if site.config.compile_sass {
-        watchers.push("sass");
-    }
-
-    println!("Listening for changes in {}/{{{}}}", pwd.display(), watchers.join(", "));
-
-    println!("Press Ctrl+C to stop\n");
-    // Delete the output folder on ctrl+C
-    ctrlc::set_handler(move || {
-        remove_dir_all(&output_path).expect("Failed to delete output directory");
-        ::std::process::exit(0);
-    }).expect("Error setting Ctrl-C handler");
-
-    use notify::DebouncedEvent::*;
-
     loop {
         match rx.recv() {
-            Ok(event) => {
-                match event {
-                    Create(path) |
-                    Write(path) |
-                    Remove(path) |
-                    Rename(_, path) => {
-                        if is_temp_file(&path) || path.is_dir() {
-                            continue;
-                        }
-
-                        println!("Change detected @ {}", Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-                        let start = Instant::now();
-                        match detect_change_kind(&pwd, &path) {
-                            (ChangeKind::Content, _) => {
-                                console::info(&format!("-> Content changed {}", path.display()));
-                                // Force refresh
-                                rebuild_done_handling(&broadcaster, rebuild::after_content_change(&mut site, &path), "/x.js");
-                            },
-                            (ChangeKind::Templates, _) => {
-                                console::info(&format!("-> Template changed {}", path.display()));
-                                // Force refresh
-                                rebuild_done_handling(&broadcaster, rebuild::after_template_change(&mut site, &path), "/x.js");
-                            },
-                            (ChangeKind::StaticFiles, p) => {
-                                if path.is_file() {
-                                    console::info(&format!("-> Static file changes detected {}", path.display()));
-                                    rebuild_done_handling(&broadcaster, copy_file(&path, &site.output_path, &site.static_path), &p.to_string_lossy());
-                                }
-                            },
-                            (ChangeKind::Sass, p) => {
-                                console::info(&format!("-> Sass file changed {}", path.display()));
-                                rebuild_done_handling(&broadcaster, site.compile_sass(&site.base_path), &p.to_string_lossy());
-                            },
-                            (ChangeKind::Config, _) => {
-                                console::info(&format!("-> Config changed. The whole site will be reloaded. The browser needs to be refreshed to make the changes visible."));
-                                site = create_new_site(interface, port, output_dir, base_url, config_file).unwrap().0;
-                            }
-                        };
-                        console::report_elapsed_time(start);
-                    }
-                    _ => {}
-                }
+            Ok(msg) => {
+                broadcaster.send(msg).unwrap();
             },
             Err(e) => console::error(&format!("Watch error: {:?}", e)),
         };
     }
 }
 
-/// Returns whether the path we received corresponds to a temp file created
-/// by an editor or the OS
-fn is_temp_file(path: &Path) -> bool {
-    let ext = path.extension();
-    match ext {
-        Some(ex) => match ex.to_str().unwrap() {
-            "swp" | "swx" | "tmp" | ".DS_STORE" => true,
-            // jetbrains IDE
-            x if x.ends_with("jb_old___") => true,
-            x if x.ends_with("jb_tmp___") => true,
-            x if x.ends_with("jb_bak___") => true,
-            // vim
-            x if x.ends_with('~') => true,
-            _ => {
-                if let Some(filename) = path.file_stem() {
-                    // emacs
-                    let name = filename.to_str().unwrap();
-                    name.starts_with('#') || name.starts_with(".#")
-                } else {
-                    false
-                }
-            }
-        },
-        None => {
-            true
-        },
-    }
-}
-
-/// Detect what changed from the given path so we have an idea what needs
-/// to be reloaded
-fn detect_change_kind(pwd: &Path, path: &Path) -> (ChangeKind, PathBuf) {
-    let mut partial_path = PathBuf::from("/");
-    partial_path.push(path.strip_prefix(pwd).unwrap_or(path));
-
-    let change_kind = if partial_path.starts_with("/templates") {
-        ChangeKind::Templates
-    } else if partial_path.starts_with("/content") {
-        ChangeKind::Content
-    } else if partial_path.starts_with("/static") {
-        ChangeKind::StaticFiles
-    } else if partial_path.starts_with("/sass") {
-        ChangeKind::Sass
-    } else if partial_path == Path::new("/config.toml") {
-        ChangeKind::Config
-    } else {
-        unreachable!("Got a change in an unexpected path: {}", partial_path.display());
-    };
-
-    (change_kind, partial_path)
-}
 
 #[cfg(test)]
 mod tests {

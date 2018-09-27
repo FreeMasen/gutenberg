@@ -63,5 +63,21 @@ pub fn build_cli() -> App<'static, 'static> {
                         .takes_value(true)
                         .help("Changes the base_url"),
                 ]),
+            SubCommand::with_name("watch")
+                .about("Watch site directory for change, automatically rebuilding on save")
+                .args(&[
+                    Arg::with_name("output_dir")
+                        .short("o")
+                        .long("output-dir")
+                        .default_value("public")
+                        .takes_value(true)
+                        .help("Outputs the generated site in the given path"),
+                    Arg::with_name("base_url")
+                        .short("u")
+                        .long("base-url")
+                        .default_value("http://127.0.0.1")
+                        .takes_value(true)
+                        .help("Changes the base_url")
+                ])
         ])
 }

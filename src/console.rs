@@ -51,7 +51,7 @@ pub fn notify_site_size(site: &Site) {
         "-> Creating {} pages ({} orphan), {} sections, and processing {} images",
         site.pages.len(),
         site.get_all_orphan_pages().len(),
-        site.sections.len() - 1, // -1 since we do not the index as a section
+        site.sections.len().saturating_sub(1), // -1 since we do not the index as a section
         site.num_img_ops(),
     );
 }

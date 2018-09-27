@@ -18,6 +18,7 @@ extern crate content;
 extern crate front_matter;
 extern crate utils;
 extern crate rebuild;
+extern crate env_logger;
 
 use std::time::Instant;
 
@@ -28,6 +29,8 @@ mod prompt;
 
 
 fn main() {
+    std::env::set_var("RUST_LOG", "actix_web=info");
+    env_logger::init();
     let matches = cli::build_cli().get_matches();
 
     let config_file = matches.value_of("config").unwrap();
@@ -68,6 +71,15 @@ fn main() {
                 },
             };
         },
+        ("watch", Some(matches)) => {
+            let output_dir = matches.value_of("output_dir").unwrap();
+            let base_url = matches.value_of("base_url").unwrap();
+            console::info("Building site...");
+            if let Err(e) = cmd::watch(output_dir, base_url, config_file, &None) {
+                console::unravel_errors("", &e);
+                ::std::process::exit(1);
+            }
+        }
         _ => unreachable!(),
     }
 }
